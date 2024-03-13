@@ -2,16 +2,17 @@
 pragma solidity ^0.8.9;
 
 import "@openzeppelin/contracts-upgradeable/utils/cryptography/EIP712Upgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/token/ERC721/IERC721Upgradeable.sol";
+import "./IERC7583Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/token/ERC1155/IERC1155Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import "contracts/lib/Struct.sol";
 import "contracts/lib/Enum.sol";
 
-contract InscriptionMarket_v1 is
+import "hardhat/console.sol";
+
+contract InscriptionMarket_v2 is
     OwnableUpgradeable,
     EIP712Upgradeable,
     OrderParameterBase,
@@ -19,51 +20,25 @@ contract InscriptionMarket_v1 is
 {
     using SafeERC20Upgradeable for IERC20Upgradeable;
 
-    struct OrderStatus {
-        bool isValidated;
-        bool isCancelled;
-    }
+    address public feeReceiver;
 
     // 100 / 10000
-    struct CollectionFee {
-        uint64 marketFee;
-        uint64 projectFee;
-        uint64 ipFee;
-    }
-
-    address public marketVault;
-    address public projectVault;
-    address public ipVault;
-    // collection address => fees
-    mapping(address => CollectionFee) public fees;
-
-    mapping(address => bool) public whitelist; // Users in the whitelist can enjoy free transaction fee
+    uint256 public feeRate;
 
     // offerer => counter
     mapping(address => uint256) public counters;
     // order hash => status
-    mapping(bytes32 => OrderStatus) public orderStatus;
+    mapping(bytes32 => uint256) public orderStatus;
 
-    // collection permission
-    mapping(address => bool) public collections;
-
-    event OrderCancelled(address indexed canceller, uint256 indexed salt);
+    event OrderCancelled(address indexed canceller, bytes32 indexed salt);
     event Sold(
         bytes32 indexed orderHash,
-        uint256 indexed salt,
         uint256 indexed time,
         address from,
-        address to
+        address to,
+        uint256 price
     );
-    event SetVaults(address marketVault, address projectVault, address ipVault);
-    event SetWhiteList(address[] users, bool[] permissions);
-    event SetCollection(address collection, bool permission);
-    event SetCollectionFee(
-        address collection,
-        uint64 marketFee,
-        uint64 projectFee,
-        uint64 ipFee
-    );
+    event SetFee(address feeReceiver, uint256 feeRate);
     event CounterIncremented(uint256 indexed counter, address indexed user);
 
     error OrderTypeError(ItemType offerType, ItemType considerationType);
@@ -76,6 +51,15 @@ contract InscriptionMarket_v1 is
         __Ownable_init();
         __EIP712_init(name, version);
     }
+    /* 
+        - Cancellation verification can be performed proactively on-chain.
+        - Zone is essentially a logic similar to a signature machine.
+        - Conduit provides a way for the project party to manage authorization.
+
+        Criteria can be used to place multiple NFTs in a single order, and Advanced methods are required to facilitate partial fulfillment. If Criteria is set to 0, any tokenId owned by the user can be fulfilled without further verification of its inclusion in the order.
+
+        The Advanced method allows specifying the recipient address for the NFT.
+     */
 
     function _verify(
         bytes32 orderHash,
@@ -86,13 +70,21 @@ contract InscriptionMarket_v1 is
         return (signer);
     }
 
+    /// @notice The entire order is executed at once, which can be either selling an NFT or offering tokens to purchase an NFT. 
+    /// @notice Transaction Scenario: Used when trading artwork, INSC's savings jar, and ORUS's engraved NFT.
+    /// @notice The offer at this point is not for the FT (fungible token), but for a specific tokenId.
+    // TODO: Support users to place multiple NFTs in a single order at once.
     function fulfillOrder(
         OrderParameters calldata order
     ) external payable nonReentrant {
         address from;
         address to;
         // calculate order hash
-        bytes32 orderHash = _deriveOrderHash(order, counters[order.offerer]);
+        bytes32 orderHash = _deriveOrderHash_NotArray(order, counters[order.offerer]);
+        console.logBytes32(orderHash);
+
+        bytes32 orderHash_ = _deriveOrderHash(order, counters[order.offerer]);
+        console.logBytes32(orderHash_);
 
         require(
             block.timestamp >= order.startTime &&
@@ -100,10 +92,11 @@ contract InscriptionMarket_v1 is
             "Time error"
         );
 
-        OrderStatus storage _orderStatus = orderStatus[orderHash];
+        OfferItem memory offerItem = order.offer[0];
+
         require(
-            !_orderStatus.isCancelled && !_orderStatus.isValidated,
-            "Status error"
+            orderStatus[orderHash] < offerItem.startAmount,
+            "Order filled or canceled"
         );
 
         // verify signature
@@ -112,98 +105,16 @@ contract InscriptionMarket_v1 is
             "Sign error"
         );
 
-        require(
-            order.consideration.length == 1 && order.offer.length == 1,
-            "Param length error"
-        );
-
         // transfer fee
-        uint256 _marketFee;
-        uint256 _projectFee;
-        uint256 _ipFee;
-        uint256 _totalFee;
+        uint256 _serviceFee;
+
         ConsiderationItem memory consideration = order.consideration[0];
-        OfferItem memory offerItem = order.offer[0];
         if (offerItem.itemType == ItemType.NATIVE) {
             // ETH can't approve, offer's type cann't be NATIVE
             revert OrderTypeError(offerItem.itemType, consideration.itemType);
         }
-        if (!whitelist[msg.sender]) {
-            // consideration
-            if (
-                consideration.itemType == ItemType.NATIVE ||
-                consideration.itemType == ItemType.ERC20
-            ) {
-                _marketFee =
-                    (consideration.startAmount *
-                        fees[offerItem.token].marketFee) /
-                    10000;
-                _projectFee =
-                    (consideration.startAmount *
-                        fees[offerItem.token].projectFee) /
-                    10000;
-                _ipFee =
-                    (consideration.startAmount * fees[offerItem.token].ipFee) /
-                    10000;
-                _totalFee = _marketFee + _projectFee + _ipFee;
 
-                if (consideration.itemType == ItemType.NATIVE) {
-                    payable(marketVault).transfer(_marketFee);
-                    payable(projectVault).transfer(_projectFee);
-                    payable(ipVault).transfer(_ipFee);
-                } else {
-                    IERC20Upgradeable(consideration.token).safeTransferFrom(
-                        msg.sender,
-                        marketVault,
-                        _marketFee
-                    );
-
-                    IERC20Upgradeable(consideration.token).safeTransferFrom(
-                        msg.sender,
-                        projectVault,
-                        _projectFee
-                    );
-                    IERC20Upgradeable(consideration.token).safeTransferFrom(
-                        msg.sender,
-                        ipVault,
-                        _ipFee
-                    );
-                }
-            } else if (
-                // offer
-                offerItem.itemType == ItemType.ERC20
-            ) {
-                _marketFee =
-                    (offerItem.startAmount *
-                        fees[consideration.token].marketFee) /
-                    10000;
-                _projectFee =
-                    (offerItem.startAmount *
-                        fees[consideration.token].projectFee) /
-                    10000;
-                _ipFee =
-                    (offerItem.startAmount * fees[consideration.token].ipFee) /
-                    10000;
-                _totalFee = _marketFee + _projectFee + _ipFee;
-
-                IERC20Upgradeable(offerItem.token).safeTransferFrom(
-                    order.offerer,
-                    marketVault,
-                    _marketFee
-                );
-                IERC20Upgradeable(offerItem.token).safeTransferFrom(
-                    order.offerer,
-                    projectVault,
-                    _projectFee
-                );
-                IERC20Upgradeable(offerItem.token).safeTransferFrom(
-                    order.offerer,
-                    ipVault,
-                    _ipFee
-                );
-            }
-        }
-
+        uint256 price;
         // Consideration
         if (
             consideration.itemType == ItemType.NATIVE ||
@@ -211,8 +122,7 @@ contract InscriptionMarket_v1 is
         ) {
             // check offer type, NATIVE/ERC20 <-> ERC721/ERC1155
             if (
-                offerItem.itemType != ItemType.ERC721 &&
-                offerItem.itemType != ItemType.ERC1155
+                offerItem.itemType != ItemType.ERC721
             ) {
                 revert OrderTypeError(
                     offerItem.itemType,
@@ -220,44 +130,46 @@ contract InscriptionMarket_v1 is
                 );
             }
 
+            _serviceFee = (consideration.startAmount * feeRate) / 10000;
+            price = consideration.startAmount;
             if (consideration.itemType == ItemType.NATIVE) {
                 require(
                     msg.value >= consideration.startAmount,
                     "TX value error"
                 );
-                payable(consideration.recipient).transfer(
-                    consideration.startAmount - _totalFee
-                );
+                payable(feeReceiver).transfer(_serviceFee);
+                unchecked {
+                    payable(consideration.recipient).transfer(
+                        consideration.startAmount - _serviceFee
+                    );
+                }
             } else if (consideration.itemType == ItemType.ERC20) {
                 IERC20Upgradeable(consideration.token).safeTransferFrom(
                     msg.sender,
+                    feeReceiver,
+                    _serviceFee
+                );
+                IERC20Upgradeable(consideration.token).safeTransferFrom(
+                    msg.sender,
                     consideration.recipient,
-                    consideration.startAmount - _totalFee
+                    consideration.startAmount - _serviceFee
                 );
             }
         } else if (
-            consideration.itemType == ItemType.ERC721 ||
-            consideration.itemType == ItemType.ERC1155
+            consideration.itemType == ItemType.ERC721
         ) {
-            require(
-                collections[consideration.token],
-                "ERROR: This collection has no permission"
-            );
-            if (consideration.itemType == ItemType.ERC721) {
-                IERC721Upgradeable(consideration.token).safeTransferFrom(
-                    msg.sender,
-                    consideration.recipient,
-                    consideration.identifierOrCriteria
-                );
-            } else if (consideration.itemType == ItemType.ERC1155) {
-                IERC1155Upgradeable(consideration.token).safeTransferFrom(
-                    msg.sender,
-                    consideration.recipient,
-                    consideration.identifierOrCriteria,
-                    consideration.startAmount,
-                    "0x0"
+            if (offerItem.itemType != ItemType.ERC20) {
+                // other offer type is not support
+                revert OrderTypeError(
+                    offerItem.itemType,
+                    consideration.itemType
                 );
             }
+            IERC7583Upgradeable(consideration.token).safeTransferFrom(
+                msg.sender,
+                consideration.recipient,
+                consideration.identifierOrCriteria
+            );
 
             from = msg.sender;
             to = consideration.recipient;
@@ -267,49 +179,36 @@ contract InscriptionMarket_v1 is
         }
 
         // Offer
-        if (offerItem.itemType == ItemType.NATIVE) {
-            // offer's type cann't be NATIVE
-            revert OrderTypeError(offerItem.itemType, consideration.itemType);
-        } else if (offerItem.itemType == ItemType.ERC20) {
+        if (offerItem.itemType == ItemType.ERC20) {
             // check consideration type
             if (
-                consideration.itemType != ItemType.ERC721 &&
-                consideration.itemType != ItemType.ERC1155
+                consideration.itemType != ItemType.ERC721
             ) {
                 revert OrderTypeError(
                     offerItem.itemType,
                     consideration.itemType
                 );
             }
+            _serviceFee = (offerItem.startAmount * feeRate) / 10000;
+            price = offerItem.startAmount;
+            IERC20Upgradeable(offerItem.token).safeTransferFrom(
+                order.offerer,
+                feeReceiver,
+                _serviceFee
+            );
             IERC20Upgradeable(offerItem.token).safeTransferFrom(
                 order.offerer,
                 msg.sender,
-                offerItem.startAmount - _totalFee
+                offerItem.startAmount - _serviceFee
             );
         } else if (
-            offerItem.itemType == ItemType.ERC721 ||
-            offerItem.itemType == ItemType.ERC1155
+            offerItem.itemType == ItemType.ERC721
         ) {
-            require(
-                collections[offerItem.token],
-                "ERROR: This collection has no permission"
+            IERC7583Upgradeable(offerItem.token).safeTransferFrom(
+                order.offerer,
+                msg.sender,
+                offerItem.identifierOrCriteria
             );
-
-            if (offerItem.itemType == ItemType.ERC721) {
-                IERC721Upgradeable(offerItem.token).safeTransferFrom(
-                    order.offerer,
-                    msg.sender,
-                    offerItem.identifierOrCriteria
-                );
-            } else if (offerItem.itemType == ItemType.ERC1155) {
-                IERC1155Upgradeable(offerItem.token).safeTransferFrom(
-                    order.offerer,
-                    msg.sender,
-                    offerItem.identifierOrCriteria,
-                    offerItem.startAmount,
-                    "0x0"
-                );
-            }
 
             from = order.offerer;
             to = msg.sender;
@@ -318,13 +217,185 @@ contract InscriptionMarket_v1 is
             revert OrderTypeError(offerItem.itemType, consideration.itemType);
         }
 
-        _orderStatus.isValidated = true;
+        orderStatus[orderHash] = offerItem.startAmount;
 
-        emit Sold(orderHash, order.salt, block.timestamp, from, to);
+        emit Sold(orderHash, block.timestamp, from, to, price);
     }
 
+    // TODO: 
+    /// @notice To complete multiple transactions at once, such as purchasing multiple NFTs or accepting multiple offers, the concept of an aggregator is required.
+    // How to bypass failed NFTs
+    // How to save gas
+    // Whether to support simultaneous transactions of NFTs from different collections is not required.
+    function multipleFillOrder(
+        OrderParameters[] calldata orders
+    ) external payable nonReentrant {
+
+    }
+
+    // TODO: 
+    /// @notice Partial fulfillment in a single transaction without transferring NFTs, only purchasing a portion of the FTs.
+    function partialFillOrder(
+        OrderParameters calldata order
+    ) external payable nonReentrant {
+       
+    }
+
+    /// @notice Accept the offer for FT and it is a large order, where the sum of the FT quantities in multiple NFTs does not exceed the quantity of this offer.
+    function takeOffer(
+        OrderParameters calldata order, address considerationAddr, uint256[] calldata insIds
+    ) external payable nonReentrant {
+        // calculate order hash
+        bytes32 orderHash = _deriveOrderHash(order, counters[order.offerer]);
+        require(
+            block.timestamp >= order.startTime &&
+                block.timestamp <= order.endTime,
+            "Time error"
+        );
+
+        OfferItem memory offerItem = order.offer[0];
+        ConsiderationItem memory consideration = order.consideration[0];
+
+        require(
+            orderStatus[orderHash] < offerItem.startAmount,
+            "Order filled or canceled"
+        );
+
+        require(consideration.identifierOrCriteria == type(uint256).max && consideration.token == considerationAddr, "Params error");
+
+        // verify signature
+        require(
+            _verify(orderHash, order.signature) == order.offerer,
+            "Sign error"
+        );
+
+        if (offerItem.itemType != ItemType.ERC20 && consideration.itemType != ItemType.ERC721) {
+            revert OrderTypeError(offerItem.itemType, consideration.itemType);
+        }
+
+        uint256 price;
+        for (uint256 i; i < insIds.length; i++) {
+            uint256 insId = insIds[i];
+
+            require(msg.sender == IERC7583Upgradeable(considerationAddr).ownerOf(insId), "Is not yours");
+
+            price += IERC7583Upgradeable(considerationAddr).balanceOfIns(insId) * offerItem.endAmount;
+            
+            IERC7583Upgradeable(considerationAddr).safeTransferFrom(
+                msg.sender,
+                consideration.recipient,
+                insId
+            );
+        }
+
+        require (price < offerItem.startAmount - orderStatus[orderHash], "Insufficient value");
+
+        uint256 _serviceFee = (price * feeRate) / 10000;
+        IERC20Upgradeable(offerItem.token).safeTransferFrom(
+            order.offerer,
+            feeReceiver,
+            _serviceFee
+        );
+        IERC20Upgradeable(offerItem.token).safeTransferFrom(
+            order.offerer,
+            msg.sender,
+            price - _serviceFee
+        );
+
+        orderStatus[orderHash] += price;
+
+        emit Sold(orderHash, block.timestamp, msg.sender, consideration.recipient, price);
+    }
+
+    // TODO: 
+    /// @notice Accept multiple offers for FT, where the prices of these offers may vary.
+    function takeOffers(
+        OrderParameters[] calldata orders, address considerationAddr, uint256 insId
+    ) external payable nonReentrant {
+    }
+
+    // TODO: 
+    /// @notice for market makers
+    function matchOrders(
+        OrderParameters[] calldata lists, OrderParameters[] calldata offers
+    ) external payable nonReentrant {
+    }
+
+    /* function fulfillOrderOffer(
+        OrderParameters[] calldata orders, address considerationAddr, uint256 insId
+    ) external payable nonReentrant {
+        require(msg.sender == IERC7583Upgradeable(considerationAddr).ownerOf(insId), "Is not yours");
+
+        for (uint256 i; i < orders.length; i++) {
+            OrderParameters order = orders[i];
+
+            // calculate order hash
+            bytes32 orderHash = _deriveOrderHash(order, counters[order.offerer]);
+            require(
+                block.timestamp >= order.startTime &&
+                    block.timestamp <= order.endTime,
+                "Time error"
+            );
+
+            OfferItem memory offerItem = order.offer[0];
+            ConsiderationItem memory consideration = order.consideration[0];
+
+            require(
+                orderStatus[orderHash] < offerItem.startAmount,
+                "Order filled or canceled"
+            );
+
+            require(consideration.identifierOrCriteria == type(uint256).max && consideration.token == considerationAddr, "Params error");
+
+            // verify signature
+            require(
+                _verify(orderHash, order.signature) == order.offerer,
+                "Sign error"
+            );
+
+            if (offerItem.itemType != ItemType.ERC20 && consideration.itemType != ItemType.ERC721) {
+                // ETH can't approve, offer's type cann't be NATIVE
+                revert OrderTypeError(offerItem.itemType, consideration.itemType);
+            }
+
+            // transfer fee
+            uint256 _serviceFee;
+            uint256 price;
+            uint256 balanceOfIns = IERC7583Upgradeable(considerationAddr).balanceOfIns(insId);
+
+            if (balanceOfIns * offerItem.endAmount > offerItem.startAmount) {
+                
+            }
+            
+            IERC7583Upgradeable(consideration.token).safeTransferFrom(
+                msg.sender,
+                consideration.recipient,
+                consideration.identifierOrCriteria
+            );
+
+
+            // Offer
+                
+            _serviceFee = (offerItem.startAmount * feeRate) / 10000;
+            price = offerItem.startAmount;
+            IERC20Upgradeable(offerItem.token).safeTransferFrom(
+                order.offerer,
+                feeReceiver,
+                _serviceFee
+            );
+            IERC20Upgradeable(offerItem.token).safeTransferFrom(
+                order.offerer,
+                msg.sender,
+                offerItem.startAmount - _serviceFee
+            );
+
+            orderStatus[orderHash] = offerItem.startAmount;
+
+            emit Sold(orderHash, order.salt, block.timestamp, msg.sender, to, price);
+        }
+    } */
+
     function cancel(OrderComponents[] calldata orders) external nonReentrant {
-        OrderStatus storage _orderStatus;
         address offerer;
 
         for (uint256 i = 0; i < orders.length; ) {
@@ -353,78 +424,21 @@ contract InscriptionMarket_v1 is
             );
 
             // Retrieve the order status using the derived order hash.
-            _orderStatus = orderStatus[orderHash];
-
-            // Update the order status as not valid and cancelled.
-            _orderStatus.isValidated = false;
-            _orderStatus.isCancelled = true;
+            orderStatus[orderHash] = order.offer[0].startAmount;
 
             // Emit an event signifying that the order has been cancelled.
-            emit OrderCancelled(offerer, order.salt);
+            emit OrderCancelled(offerer, orderHash);
 
             // Increment counter inside body of loop for gas efficiency.
             ++i;
         }
     }
 
-    function setCollection(
-        address collection,
-        bool permission
-    ) public onlyOwner {
-        require(
-            marketVault != address(0) &&
-                projectVault != address(0) &&
-                ipVault != address(0),
-            "ERROR: vault is empty"
-        );
-        collections[collection] = permission;
-        emit SetCollection(collection, permission);
-    }
-
-    function setWhiteList(
-        address[] calldata users,
-        bool[] calldata permissions
-    ) public onlyOwner {
-        for (uint256 i; i < users.length; i++) {
-            whitelist[users[i]] = permissions[i];
-        }
-        emit SetWhiteList(users, permissions);
-    }
-
-    function setFees(
-        address collectionAddress,
-        CollectionFee calldata fees_
-    ) public onlyOwner {
-        require(
-            marketVault != address(0) &&
-                projectVault != address(0) &&
-                ipVault != address(0),
-            "ERROR: vault is empty"
-        );
-        require(
-            fees_.marketFee + fees_.projectFee + fees_.ipFee < 10000,
-            "exceed max fee"
-        );
-        fees[collectionAddress] = fees_;
-        emit SetCollectionFee(
-            collectionAddress,
-            fees_.marketFee,
-            fees_.projectFee,
-            fees_.ipFee
-        );
-        if (!collections[collectionAddress]) {
-            collections[collectionAddress] = true;
-        }
-    }
-
-    function setVaults(
-        address marketVault_,
-        address projectVault_,
-        address ipVault_
-    ) public onlyOwner {
-        marketVault = marketVault_;
-        projectVault = projectVault_;
-        ipVault = ipVault_;
-        emit SetVaults(marketVault_, projectVault_, ipVault_);
+    function setFees(uint256 fee, address receiver) public onlyOwner {
+        require(receiver != address(0), "fee receiver is empty");
+        require(fee < 10000, "exceed max fee");
+        feeReceiver = receiver;
+        feeRate = fee;
+        emit SetFee(receiver, fee);
     }
 }
