@@ -41,6 +41,27 @@ struct OrderComponents {
     uint256 counter;
 }
 
+struct OrderParameters_NotArray {
+    address offerer;
+    OfferItem[] offer;
+    ConsiderationItem[] consideration;
+    uint256 startTime;
+    uint256 endTime;
+    uint256 salt;
+    bytes signature;
+}
+
+struct OrderComponents_NotArray {
+    address offerer;
+    OfferItem[] offer;
+    ConsiderationItem[] consideration;
+    uint256 startTime;
+    uint256 endTime;
+    uint256 salt;
+    bytes signature;
+    uint256 counter;
+}
+
 contract OrderParameterBase {
     bytes internal constant _OFFER_ITEM = abi.encodePacked(
         "OfferItem(",

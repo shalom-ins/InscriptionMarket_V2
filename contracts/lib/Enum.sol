@@ -7,7 +7,5 @@ enum ItemType {
     // 1: ERC20 items (ERC777 and ERC20 analogues could also technically work)
     ERC20,
     // 2: ERC721 items
-    ERC721,
-    // 3: ERC1155 items
-    ERC1155
+    ERC721
 }

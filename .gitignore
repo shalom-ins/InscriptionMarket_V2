@@ -11,3 +11,8 @@ typechain-types
 cache
 artifacts
 
+contracts/INS20Innovator.sol
+contracts/ERC721
+contracts/ERC20
+contracts/InscriptionMarket_v2_tem.sol
+test/Market.test_tem.js
